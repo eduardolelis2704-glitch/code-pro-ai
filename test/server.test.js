@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import crypto from 'node:crypto';
 import {spawn} from 'node:child_process';
 import {mkdtempSync,rmSync} from 'node:fs';
 import {tmpdir} from 'node:os';
@@ -9,7 +10,7 @@ test('MVP: authentication, SDR simulation, CS tasks and meetings',async()=>{
  const dir=mkdtempSync(join(tmpdir(),'code-pro-ai-'));
  const port=32000+Math.floor(Math.random()*2000);
  const token='test-token-strong-admin';
- const child=spawn(process.execPath,['server.js'],{cwd:process.cwd(),env:{...process.env,PORT:String(port),ADMIN_TOKEN:token,WEBHOOK_TOKEN:'test-token-webhook',DATA_FILE:join(dir,'state.json'),SEND_ENABLED:'false',AI_ENABLED:'false'},stdio:'pipe'});
+ const child=spawn(process.execPath,['server.js'],{cwd:process.cwd(),env:{...process.env,PORT:String(port),ADMIN_TOKEN:token,WEBHOOK_TOKEN:'test-token-webhook',OPENWA_WEBHOOK_SECRET:'test-secret-hmac',DATA_FILE:join(dir,'state.json'),SEND_ENABLED:'false',AI_ENABLED:'false'},stdio:'pipe'});
  const base='http://127.0.0.1:'+port;
  const api=async(path,method='GET',data,authorization=true)=>{
    const response=await fetch(base+path,{method,headers:{...(authorization?{Authorization:'Bearer '+token}:{}),'Content-Type':'application/json'},body:data?JSON.stringify(data):undefined});
@@ -34,6 +35,12 @@ test('MVP: authentication, SDR simulation, CS tasks and meetings',async()=>{
    assert.equal(stored.tasks.length,1);
    assert.equal(stored.meetings.length,1);
    assert.equal((await api('/webhooks/openwa','POST',{data:{message:{from:'5511999999999@c.us',body:'Oi'}}})).status,401);
-   assert.equal((await api('/api/overview')).data.total,2);
+   const webhookData=JSON.stringify({data:{message:{id:'msg-signed',from:'5511999999999@c.us',body:'Oi'}}});
+   const signature='sha256='+crypto.createHmac('sha256','test-secret-hmac').update(webhookData).digest('hex');
+   const posted=await fetch(base+'/webhooks/openwa?token=test-token-webhook',{method:'POST',headers:{'Content-Type':'application/json','X-OpenWA-Signature':signature,'X-OpenWA-Idempotency-Key':'message-1'},body:webhookData});
+   assert.equal(posted.status,200);
+   const duplicated=await fetch(base+'/webhooks/openwa?token=test-token-webhook',{method:'POST',headers:{'Content-Type':'application/json','X-OpenWA-Signature':signature,'X-OpenWA-Idempotency-Key':'message-1'},body:webhookData});
+   assert.equal((await duplicated.json()).duplicate,true);
+   assert.equal((await api('/api/overview')).data.total,3);
  }finally{child.kill();rmSync(dir,{recursive:true,force:true})}
 });
