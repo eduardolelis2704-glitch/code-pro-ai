@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 const root=path.dirname(fileURLToPath(import.meta.url));
 try { const env=fs.readFileSync(path.join(root,'.env'),'utf8'); for(const line of env.split(/\r?\n/)){const m=line.match(/^([A-Z0-9_]+)=(.*)$/);if(m&&!process.env[m[1]])process.env[m[1]]=m[2]}}
 catch {}
-const cfg={port:Number(process.env.PORT||3100),admin:process.env.ADMIN_TOKEN||'',webhook:process.env.WEBHOOK_TOKEN||'',send:process.env.SEND_ENABLED==='true',ai:process.env.AI_ENABLED==='true',openwa:process.env.OPENWA_URL||'',key:process.env.OPENWA_API_KEY||'',session:process.env.OPENWA_SESSION_ID||'',model:process.env.OPENAI_MODEL||'gpt-4.1-mini',data:path.resolve(root,process.env.DATA_FILE||'data/state.json')};
+const cfg={port:Number(process.env.PORT||3100),admin:process.env.ADMIN_TOKEN||'',webhook:process.env.WEBHOOK_TOKEN||'',webhookHmac:process.env.OPENWA_WEBHOOK_SECRET||'',send:process.env.SEND_ENABLED==='true',ai:process.env.AI_ENABLED==='true',openwa:process.env.OPENWA_URL||'',key:process.env.OPENWA_API_KEY||'',session:process.env.OPENWA_SESSION_ID||'',model:process.env.OPENAI_MODEL||'gpt-4.1-mini',data:path.resolve(root,process.env.DATA_FILE||'data/state.json')};
 if(!cfg.admin||cfg.admin.startsWith('troque-')){console.error('Defina ADMIN_TOKEN seguro antes de iniciar.');process.exit(1)}
 if(!cfg.webhook||cfg.webhook.startsWith('troque-')){console.error('Defina WEBHOOK_TOKEN seguro antes de iniciar.');process.exit(1)}
 if(cfg.admin===cfg.webhook){console.error('ADMIN_TOKEN e WEBHOOK_TOKEN devem ser diferentes.');process.exit(1)}
@@ -48,7 +48,9 @@ c.followupAt=c.type==='sdr'&&!c.paused?new Date(Date.now()+36*3600000).toISOStri
 save();return {reply,delivery,contact:c}
 }
 function json(res,status,data){res.writeHead(status,{'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store'});res.end(JSON.stringify(data))}
-async function body(req){let raw='';for await(const part of req){raw+=part;if(raw.length>200000)throw Error('Payload muito grande')}return JSON.parse(raw||'{}')}
+async function rawBody(req){const parts=[];let size=0;for await(const part of req){size+=part.length;if(size>200000)throw Error('Payload muito grande');parts.push(part)}return Buffer.concat(parts)}
+async function body(req){return JSON.parse((await rawBody(req)).toString('utf8')||'{}')}
+function webhookVerified(req,raw){if(!cfg.webhookHmac)return false;const signature=String(req.headers['x-openwa-signature']||'');const expected='sha256='+crypto.createHmac('sha256',cfg.webhookHmac).update(raw).digest('hex');const a=Buffer.from(signature);const b=Buffer.from(expected);return a.length===b.length&&crypto.timingSafeEqual(a,b)}
 function auth(req){const h=req.headers.authorization||'';const supplied=h.startsWith('Bearer ')?h.slice(7):'';return supplied.length===cfg.admin.length&&crypto.timingSafeEqual(Buffer.from(supplied),Buffer.from(cfg.admin))}
 function normalizedWebhook(d){const o=d.data||d.payload||d;const m=o.message||o;const sender=m.from||m.chatId||m.sender||o.from||'';const text=m.body||m.text?.body||m.text||o.body||'';const key=String(m.id?._serialized||m.id||d.id||'');return {sender:typeof sender==='string'?sender:'',text:typeof text==='string'?text:'',key,fromMe:Boolean(m.fromMe||m.key?.fromMe),isGroup:Boolean(m.isGroup||String(sender).endsWith('@g.us'))}}
 const allowedStatuses={sdr:['novo','experiencia','faturamento','capital','qualificado','call','negociacao','ganho','perdido','nutricao'],cs:['onboarding','ativo','atencao','concluido','cancelado']};
@@ -57,10 +59,13 @@ try{const url=new URL(req.url,'http://localhost');const route=url.pathname;const
 if(route==='/health')return json(res,200,{status:'ok',sendEnabled:cfg.send,aiEnabled:cfg.ai});
 if(route==='/webhooks/openwa'&&method==='POST'){
  if(!cfg.webhook||url.searchParams.get('token')!==cfg.webhook)return json(res,401,{error:'Unauthorized'});
- const d=await body(req);const m=normalizedWebhook(d);
+ const raw=await rawBody(req);
+ if(!webhookVerified(req,raw))return json(res,401,{error:'Invalid OpenWA signature'});
+ const d=JSON.parse(raw.toString('utf8')||'{}');const m=normalizedWebhook(d);
  if(!m.sender||!m.text||m.fromMe||m.isGroup)return json(res,200,{ignored:true});
- if(m.key&&db.seen.includes(m.key))return json(res,200,{duplicate:true});
- if(m.key){db.seen.push(m.key);db.seen=db.seen.slice(-2000)}
+ const deliveryKey=String(req.headers['x-openwa-idempotency-key']||m.key||'');
+ if(deliveryKey&&db.seen.includes(deliveryKey))return json(res,200,{duplicate:true});
+ if(deliveryKey){db.seen.push(deliveryKey);db.seen=db.seen.slice(-2000);save()}
  let c=db.contacts.find(x=>x.phone===m.sender||x.phone.replace(/\D/g,'')===m.sender.replace(/\D/g,''));if(!c)c=createContact({phone:m.sender,name:clean(d.data?.pushName||'Novo lead',100)});
  const r=await inbound(c,m.text);return json(res,200,{ok:true,replyGenerated:Boolean(r?.reply),delivery:r?.delivery});
 }
